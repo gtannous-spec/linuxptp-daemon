@@ -3,7 +3,9 @@ package daemon
 import (
 	"bufio"
 	"cmp"
+	"crypto/sha256"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -71,6 +73,13 @@ var ptpProcesses = []string{
 	ptp4lProcessName,   // there could be more than one ptp4l in the system
 	phc2sysProcessName, // there can be only one phc2sys process in the system
 	chronydProcessName, // there can be only one chronyd process in the system
+}
+
+// saFileInfo tracks authentication file information for a profile
+type saFileInfo struct {
+	profileName string
+	filePath    string
+	fileHash    string
 }
 
 var ptpTmpFiles = []string{
@@ -306,6 +315,10 @@ type Daemon struct {
 
 	// Allow vendors to include plugins
 	pluginManager plugin.PluginManager
+
+	// Track sa_file (authentication) files for monitoring changes
+	saFileTracker map[string]*saFileInfo
+	saFileMutex   sync.Mutex
 }
 
 // New LinuxPTP is called by daemon to generate new linuxptp instance
@@ -348,12 +361,18 @@ func New(
 		processManager:       pm,
 		readyTracker:         tracker,
 		stopCh:               stopCh,
+		saFileTracker:        make(map[string]*saFileInfo),
 	}
 }
 
 // Run in a for loop to listen for any LinuxPTPConfUpdate changes
 func (dn *Daemon) Run() {
 	go dn.processManager.ptpEventHandler.ProcessEvents()
+
+	// Start sa_file monitoring ticker (check every 30 seconds)
+	saFileCheckTicker := time.NewTicker(30 * time.Second)
+	defer saFileCheckTicker.Stop()
+
 	for {
 		select {
 		case <-dn.ptpUpdate.UpdateCh:
@@ -361,10 +380,136 @@ func (dn *Daemon) Run() {
 			if err != nil {
 				glog.Errorf("linuxPTP apply node profile failed: %v", err)
 			}
+		case <-saFileCheckTicker.C:
+			// Check for sa_file changes
+			if dn.checkSaFileChanges() {
+				glog.Info("sa_file authentication file changed, restarting PTP processes")
+				err := dn.applyNodePTPProfiles()
+				if err != nil {
+					glog.Errorf("linuxPTP apply node profile failed after sa_file change: %v", err)
+				}
+			}
 		case <-dn.stopCh:
 			dn.stopAllProcesses()
 			glog.Infof("linuxPTP stop signal received, existing..")
 			return
+		}
+	}
+}
+
+// computeFileHash computes SHA256 hash of a file
+func computeFileHash(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+// extractSaFileFromConf extracts sa_file path from ptp4lConf if present
+func extractSaFileFromConf(ptp4lConf *string) string {
+	if ptp4lConf == nil {
+		return ""
+	}
+
+	// Parse the config to extract sa_file from [global] section
+	for _, line := range strings.Split(*ptp4lConf, "\n") {
+		line = strings.TrimSpace(line)
+		// Skip comments
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		// Look for sa_file option
+		if strings.HasPrefix(line, "sa_file") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				return parts[1]
+			}
+		}
+	}
+	return ""
+}
+
+// checkSaFileChanges checks if any tracked sa_file has changed
+func (dn *Daemon) checkSaFileChanges() bool {
+	dn.saFileMutex.Lock()
+	defer dn.saFileMutex.Unlock()
+
+	changed := false
+	for _, info := range dn.saFileTracker {
+		if info.filePath == "" {
+			continue
+		}
+
+		// Check if file exists
+		if _, err := os.Stat(info.filePath); os.IsNotExist(err) {
+			glog.Warningf("sa_file %s for profile %s does not exist", info.filePath, info.profileName)
+			continue
+		}
+
+		// Compute current hash
+		currentHash, err := computeFileHash(info.filePath)
+		if err != nil {
+			glog.Errorf("Failed to compute hash for sa_file %s: %v", info.filePath, err)
+			continue
+		}
+
+		// Compare with stored hash
+		if currentHash != info.fileHash {
+			glog.Infof("sa_file %s for profile %s has changed (old hash: %s, new hash: %s)",
+				info.filePath, info.profileName, info.fileHash, currentHash)
+			info.fileHash = currentHash
+			changed = true
+		}
+	}
+
+	return changed
+}
+
+// updateSaFileTracking updates the tracking information for sa_files from current profiles
+func (dn *Daemon) updateSaFileTracking() {
+	dn.saFileMutex.Lock()
+	defer dn.saFileMutex.Unlock()
+
+	// Clear old tracking
+	dn.saFileTracker = make(map[string]*saFileInfo)
+
+	// Add tracking for each profile that has sa_file configured
+	for _, profile := range dn.ptpUpdate.NodeProfiles {
+		if profile.Name == nil {
+			continue
+		}
+
+		saFilePath := extractSaFileFromConf(profile.Ptp4lConf)
+		if saFilePath == "" {
+			continue
+		}
+
+		glog.Infof("Tracking sa_file %s for profile %s", saFilePath, *profile.Name)
+
+		// Compute initial hash
+		hash := ""
+		if _, err := os.Stat(saFilePath); err == nil {
+			if h, err := computeFileHash(saFilePath); err == nil {
+				hash = h
+			} else {
+				glog.Warningf("Failed to compute initial hash for sa_file %s: %v", saFilePath, err)
+			}
+		} else {
+			glog.Warningf("sa_file %s does not exist yet for profile %s", saFilePath, *profile.Name)
+		}
+
+		dn.saFileTracker[*profile.Name] = &saFileInfo{
+			profileName: *profile.Name,
+			filePath:    saFilePath,
+			fileHash:    hash,
 		}
 	}
 }
@@ -502,6 +647,10 @@ func (dn *Daemon) applyNodePTPProfiles() error {
 	dn.pluginManager.PopulateHwConfig(dn.hwconfigs)
 	*dn.refreshNodePtpDevice = true
 	dn.readyTracker.setConfig(true)
+
+	// Update sa_file tracking after profiles are applied
+	dn.updateSaFileTracking()
+
 	return nil
 }
 
