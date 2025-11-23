@@ -55,7 +55,6 @@ func main() {
 	flag.Parse()
 	flagInit(cp)
 
-	glog.Info("Hello World from linuxptp-daemon-container!")
 	glog.Infof("resync period set to: %d [s]", cp.updateInterval)
 	glog.Infof("linuxptp profile path set to: %s", cp.profileDir)
 	glog.Infof("pmc poll interval set to: %d [s]", cp.pmcPollInterval)

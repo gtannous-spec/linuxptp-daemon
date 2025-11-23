@@ -366,22 +366,31 @@ func New(
 }
 
 // Run in a for loop to listen for any LinuxPTPConfUpdate changes
+// This function handles two types of configuration changes:
+// 1. PtpConfig changes (via ConfigMap) - triggers UpdateCh
+// 2. Authentication file changes (via Secret) - triggers sa_file check
+// Both trigger applyNodePTPProfiles() which restarts PTP processes WITHOUT restarting the pod
 func (dn *Daemon) Run() {
 	go dn.processManager.ptpEventHandler.ProcessEvents()
 
-	// Start sa_file monitoring ticker (check every 30 seconds)
-	saFileCheckTicker := time.NewTicker(30 * time.Second)
+	// Start sa_file monitoring ticker (check every 5 seconds for faster detection)
+	// This detects when Kubernetes updates the mounted secret file
+	// Total delay = Kubernetes propagation (1-10s) + our check interval (0-5s)
+	saFileCheckTicker := time.NewTicker(5 * time.Second)
 	defer saFileCheckTicker.Stop()
 
 	for {
 		select {
 		case <-dn.ptpUpdate.UpdateCh:
+			// PtpConfig change detected via ConfigMap
+			glog.Info("PtpConfig change detected, restarting PTP processes")
 			err := dn.applyNodePTPProfiles()
 			if err != nil {
 				glog.Errorf("linuxPTP apply node profile failed: %v", err)
 			}
 		case <-saFileCheckTicker.C:
-			// Check for sa_file changes
+			// Check for sa_file (authentication) changes
+			// When Secret is updated, Kubernetes automatically updates the mounted file
 			if dn.checkSaFileChanges() {
 				glog.Info("sa_file authentication file changed, restarting PTP processes")
 				err := dn.applyNodePTPProfiles()
@@ -397,7 +406,9 @@ func (dn *Daemon) Run() {
 	}
 }
 
-// computeFileHash computes SHA256 hash of a file
+// computeFileHash computes SHA256 hash of a file for change detection
+// This is completely generic and works with any file content (binary, text, any format)
+// Used to detect when Kubernetes updates mounted secret files
 func computeFileHash(filePath string) (string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -438,6 +449,9 @@ func extractSaFileFromConf(ptp4lConf *string) string {
 }
 
 // checkSaFileChanges checks if any tracked sa_file has changed
+// When a Secret is updated in Kubernetes, the mounted file is automatically updated
+// This function detects those changes via hash comparison and returns true if any file changed
+// This triggers a PTP process restart (not pod restart) - same as ConfigMap changes
 func (dn *Daemon) checkSaFileChanges() bool {
 	dn.saFileMutex.Lock()
 	defer dn.saFileMutex.Unlock()
@@ -463,7 +477,7 @@ func (dn *Daemon) checkSaFileChanges() bool {
 
 		// Compare with stored hash
 		if currentHash != info.fileHash {
-			glog.Infof("sa_file %s for profile %s has changed (old hash: %s, new hash: %s)",
+			glog.Infof("sa_file %s for profile %s has changed (old hash: %.16s... -> %.16s...)",
 				info.filePath, info.profileName, info.fileHash, currentHash)
 			info.fileHash = currentHash
 			changed = true
@@ -474,6 +488,8 @@ func (dn *Daemon) checkSaFileChanges() bool {
 }
 
 // updateSaFileTracking updates the tracking information for sa_files from current profiles
+// Called after profiles are applied to initialize or update sa_file monitoring
+// Extracts sa_file paths from ptp4lConf and sets up hash-based change detection
 func (dn *Daemon) updateSaFileTracking() {
 	dn.saFileMutex.Lock()
 	defer dn.saFileMutex.Unlock()
@@ -499,6 +515,7 @@ func (dn *Daemon) updateSaFileTracking() {
 		if _, err := os.Stat(saFilePath); err == nil {
 			if h, err := computeFileHash(saFilePath); err == nil {
 				hash = h
+				glog.Infof("Initialized tracking for sa_file %s (hash: %.16s...)", saFilePath, h)
 			} else {
 				glog.Warningf("Failed to compute initial hash for sa_file %s: %v", saFilePath, err)
 			}
